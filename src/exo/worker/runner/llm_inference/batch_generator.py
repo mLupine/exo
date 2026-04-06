@@ -496,7 +496,12 @@ class BatchGenerator(InferenceGenerator):
         _check_for_debug_prompts(task.task_params)
         prompt = apply_chat_template(self.tokenizer, task.task_params)
 
+        model_id_str = str(self.model_id).lower()
+        disable_prefill_progress = "gemma-4" in model_id_str or "gemma4" in model_id_str
+
         def on_prefill_progress(processed: int, total: int) -> None:
+            if disable_prefill_progress:
+                return
             if self.device_rank == 0:
                 self.event_sender.send(
                     ChunkGenerated(

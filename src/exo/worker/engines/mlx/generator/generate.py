@@ -356,6 +356,13 @@ def warmup_inference(
 ) -> int:
     logger.info(f"warming up inference for instance: {model_id}")
 
+    model_id_str = str(model_id).lower()
+    if "gemma-4" in model_id_str or "gemma4" in model_id_str:
+        logger.warning(
+            "Skipping EXO warmup for Gemma 4, direct generation works but runner warmup can stall on first prefill"
+        )
+        return 100
+
     content = "Prompt to warm up the inference engine. Repeat this."
 
     warmup_task_params = TextGenerationTaskParams(
@@ -563,10 +570,16 @@ def mlx_generate(
 
     # Normalize stop sequences to a list
     stop_sequences: list[str] = (
-        ([task.stop] if isinstance(task.stop, str) else task.stop)
+        ([task.stop] if isinstance(task.stop, str) else list(task.stop))
         if task.stop is not None
         else []
     )
+    model_id_lower = str(task.model).lower()
+    if (
+        ("gemma-4" in model_id_lower or "gemma4" in model_id_lower)
+        and "<turn|>" not in stop_sequences
+    ):
+        stop_sequences.append("<turn|>")
     max_stop_len = max((len(s) for s in stop_sequences), default=0)
 
     maybe_vision_ctx = (

@@ -58,10 +58,17 @@ _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 
 def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
     if task_params.stop is None:
-        return []
-    if isinstance(task_params.stop, str):
-        return [task_params.stop]
-    return task_params.stop
+        stops: list[str] = []
+    elif isinstance(task_params.stop, str):
+        stops = [task_params.stop]
+    else:
+        stops = list(task_params.stop)
+
+    model_id = str(task_params.model).lower()
+    if ("gemma-4" in model_id or "gemma4" in model_id) and "<turn|>" not in stops:
+        stops.append("<turn|>")
+
+    return stops
 
 
 @dataclass
