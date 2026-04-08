@@ -102,11 +102,15 @@ def strip_gemma4_channel_tokens(text: str) -> str:
         if in_thinking_section:
             # Check if this is the start of actual response
             if stripped and len(stripped) < 80 and not any(
-                kw in stripped for kw in ['input:', 'language:', 'tone:', 'the user', 
+                kw in stripped for kw in ['input:', 'language:', 'tone:', 'the user',
                                           'respond', 'option', 'should', 'best', 'since', 'analysis']
             ):
                 in_thinking_section = False
-                result_lines.append(line)
+                # Add space before first word after thinking section
+                if result_lines and not result_lines[-1].endswith(' '):
+                    result_lines.append(' ' + line)
+                else:
+                    result_lines.append(line)
         else:
             result_lines.append(line)
     
