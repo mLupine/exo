@@ -831,7 +831,7 @@ def strip_gemma4_channel_tokens(text: str) -> str:
     
     # Remove explicit channel tokens (with surrounding whitespace/newlines)
     text = re.sub(r'\s*' + re.escape(GEMMA4_SOC_TOKEN) + r'\s*', ' ', text)
-    text = re.escape(GEMMA4_EOC_TOKEN) + r'\s*', ' ', text)
+    text = re.sub(r'\s*' + re.escape(GEMMA4_EOC_TOKEN) + r'\s*', ' ', text)
     text = re.sub(r'\s*' + re.escape(GEMMA4_TURN_START) + r'\s*', ' ', text)
     text = re.sub(r'\s*' + re.escape(GEMMA4_TURN_END) + r'\s*', ' ', text)
     
