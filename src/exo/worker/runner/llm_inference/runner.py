@@ -54,11 +54,16 @@ from exo.shared.types.worker.runners import (
 )
 from exo.utils.channels import MpReceiver, MpSender
 from exo.worker.engines.mlx.cache import KVPrefixCache
-from exo.worker.engines.mlx.utils_mlx import (
-    initialize_mlx,
-    load_mlx_items,
-)
 from exo.worker.engines.mlx.vision import VisionProcessor
+
+# Lazy imports to avoid PyInstaller issues with utils_mlx
+def _initialize_mlx(*args, **kwargs):
+    from exo.worker.engines.mlx.utils_mlx import initialize_mlx
+    return initialize_mlx(*args, **kwargs)
+
+def _load_mlx_items(*args, **kwargs):
+    from exo.worker.engines.mlx.utils_mlx import load_mlx_items
+    return load_mlx_items(*args, **kwargs)
 from exo.worker.runner.bootstrap import logger
 from exo.worker.runner.llm_inference.batch_generator import (
     BatchGenerator,
@@ -173,7 +178,7 @@ class Runner:
                 self.update_status(RunnerConnecting())
                 self.acknowledge_task(task)
 
-                self.generator.group = initialize_mlx(self.bound_instance)
+                self.generator.group = _initialize_mlx(self.bound_instance)
 
                 self.send_task_status(task.task_id, TaskStatus.Complete)
                 self.update_status(RunnerConnected())
@@ -218,7 +223,7 @@ class Runner:
                     self.generator.inference_model,
                     self.generator.tokenizer,
                     self.generator.vision_processor,
-                ) = load_mlx_items(
+                ) = _load_mlx_items(
                     self.bound_instance,
                     self.generator.group,
                     on_timeout=on_model_load_timeout,
