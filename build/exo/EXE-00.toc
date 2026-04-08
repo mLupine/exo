@@ -61,7 +61,7 @@
  [],
  False,
  False,
- 1775677598,
+ 1775677943,
  [('run',
    '/Volumes/ExtData1/Code/exo/.venv/lib/python3.13/site-packages/PyInstaller/bootloader/Darwin-64bit/run',
    'EXECUTABLE')],

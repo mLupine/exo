@@ -123,6 +123,10 @@ def strip_gemma4_channel_tokens(text: str) -> str:
     result = re.sub(r'\s+', ' ', result)  # Normalize all whitespace to single space
     result = result.strip()
 
+    # Add trailing space for proper concatenation with next chunk
+    if result and not result.endswith(' '):
+        result += ' '
+
     return result
 from exo.worker.engines.mlx.vision import (
     MediaRegion,
