@@ -46,6 +46,7 @@ from exo.worker.engines.mlx.cache import (
     encode_prompt,
     has_non_kv_caches,
     make_kv_cache,
+    materialized_cache_states,
     snapshot_ssm_states,
 )
 from exo.worker.engines.mlx.constants import (
@@ -253,7 +254,9 @@ def pipeline_parallel_prefill(
 
     assert _prompt_cache is not None
     with mx.stream(generation_stream):
-        mx.eval([c.state for c in _prompt_cache])  # type: ignore
+        states = materialized_cache_states(_prompt_cache)
+        if states:
+            mx.eval(states)
 
     # Final callback matching generate_step
     prompt_progress_callback(total, total)
@@ -309,7 +312,9 @@ def sequential_prefill(
             quantize_cache_fn(prompt_cache)
 
     with mx.stream(generation_stream):
-        mx.eval([c.state for c in prompt_cache])  # type: ignore
+        states = materialized_cache_states(prompt_cache)
+        if states:
+            mx.eval(states)
 
     progress_callback(total, total)
 

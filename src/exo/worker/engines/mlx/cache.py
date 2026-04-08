@@ -80,6 +80,36 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(isinstance(c, (ArraysCache, RotatingKVCache)) for c in cache)
 
 
+def materialized_cache_states(cache: KVCacheType) -> list[object]:
+    """Return only cache states that are actually materialized.
+
+    Some MLX cache objects keep `keys`/`values` or array-backed state as `None`
+    until a particular shard/layer is exercised. Accessing `.state` on those
+    entries raises inside mlx-lm. For pipeline-sharded Gemma 4 this can happen
+    on first prefill, so callers that only need to force evaluation should skip
+    unmaterialized entries instead of crashing the whole request.
+    """
+    states: list[object] = []
+    for idx, entry in enumerate(cache):
+        try:
+            state = entry.state
+        except AttributeError as exc:
+            if "'NoneType' object has no attribute 'shape'" not in str(exc):
+                raise
+            logger.debug(
+                "Skipping unmaterialized cache state for {} at index {}",
+                type(entry).__name__,
+                idx,
+            )
+            continue
+        if state is None:
+            continue
+        if isinstance(state, (list, tuple)) and all(x is None for x in state):
+            continue
+        states.append(state)
+    return states
+
+
 class KVPrefixCache:
     def __init__(self, group: mx.distributed.Group | None):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
