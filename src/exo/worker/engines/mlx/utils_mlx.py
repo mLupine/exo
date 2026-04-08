@@ -808,6 +808,25 @@ def fix_unmatched_think_end_tokens(
     return mx.array(result)
 
 
+# Gemma 4 channel tokens for reasoning
+GEMMA4_SOC_TOKEN = "<|channel>"
+GEMMA4_EOC_TOKEN = "<channel|>"
+
+
+def strip_gemma4_channel_tokens(text: str) -> str:
+    """Strip Gemma 4 reasoning channel tokens from generated text.
+
+    Gemma 4 uses <|channel> and <|channel|> tokens to wrap reasoning/thinking
+    content. These should be stripped from the output visible to users.
+    """
+    if not text:
+        return text
+    # Remove both start and end channel tokens
+    text = text.replace(GEMMA4_SOC_TOKEN, "")
+    text = text.replace(GEMMA4_EOC_TOKEN, "")
+    return text
+
+
 class NullKVCache(KVCache):
     """
     A KVCache that pretends to exist but holds zero tokens.

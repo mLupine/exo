@@ -200,7 +200,12 @@ class SequentialGenerator(InferenceGenerator):
     def agree_on_cancellations(self) -> None:
         """Agree between all ranks about which tasks to cancel."""
         has_cancel_all = False
-        for task_id in self.cancel_receiver.collect():
+        collected = self.cancel_receiver.collect()
+        if collected:
+            logger.warning(
+                f"SequentialGenerator collected cancellations active={self._active[0].task_id if self._active else None} known={list(self._all_tasks.keys())} ids={collected!r}"
+            )
+        for task_id in collected:
             if task_id == CANCEL_ALL_TASKS:
                 has_cancel_all = True
                 continue
@@ -210,7 +215,7 @@ class SequentialGenerator(InferenceGenerator):
         cancel_all_agreed = mx_any(has_cancel_all, self.group)
         if cancel_all_agreed and not has_cancel_all:
             logger.warning(
-                "CANCEL_ALL_TASKS observed from another rank during BatchGenerator.agree_on_cancellations"
+                "CANCEL_ALL_TASKS observed from another rank during SequentialGenerator.agree_on_cancellations"
             )
         if cancel_all_agreed:
             self._cancelled_tasks.add(CANCEL_ALL_TASKS)
@@ -466,7 +471,7 @@ class BatchGenerator(InferenceGenerator):
         collected = self.cancel_receiver.collect()
         if collected:
             logger.warning(
-                f"SequentialGenerator collected cancellations active={self._active[0].task_id if self._active else None} known={list(self._all_tasks.keys())} ids={collected!r}"
+                f"BatchGenerator collected cancellations active_uids={list(self._active_tasks.keys())} known={list(self._all_tasks.keys())} ids={collected!r}"
             )
         for task_id in collected:
             if task_id == CANCEL_ALL_TASKS:
@@ -478,7 +483,7 @@ class BatchGenerator(InferenceGenerator):
         cancel_all_agreed = mx_any(has_cancel_all, self.group)
         if cancel_all_agreed and not has_cancel_all:
             logger.warning(
-                "CANCEL_ALL_TASKS observed from another rank during SequentialGenerator.agree_on_cancellations"
+                "CANCEL_ALL_TASKS observed from another rank during BatchGenerator.agree_on_cancellations"
             )
         if cancel_all_agreed:
             self._cancelled_tasks.add(CANCEL_ALL_TASKS)

@@ -61,6 +61,7 @@ from exo.worker.engines.mlx.utils_mlx import (
     fix_unmatched_think_end_tokens,
     mx_barrier,
     normalize_encoded_tokens,
+    strip_gemma4_channel_tokens,
     system_prompt_token_count,
 )
 from exo.worker.engines.mlx.vision import (
@@ -768,24 +769,27 @@ def mlx_generate(
         ),
         start=1,
     ):
+        # Strip Gemma 4 channel tokens from output
+        stripped_text = strip_gemma4_channel_tokens(out.text)
+
         if not first_yield_logged:
             _gemma4_debug(
                 task.model,
-                f"decode_first_yield token={out.token} finish_reason={out.finish_reason} text={out.text!r}",
+                f"decode_first_yield token={out.token} finish_reason={out.finish_reason} text={stripped_text!r}",
             )
             first_yield_logged = True
-        generated_text_parts.append(out.text)
-        accumulated_text += out.text
+        generated_text_parts.append(stripped_text)
+        accumulated_text += stripped_text
 
-        if think_start is not None and out.text == think_start:
+        if think_start is not None and stripped_text == think_start:
             in_thinking = True
-        elif think_end is not None and out.text == think_end:
+        elif think_end is not None and stripped_text == think_end:
             in_thinking = False
         if in_thinking:
             reasoning_tokens += 1
 
         # Check for stop sequences
-        text = out.text
+        text = stripped_text
         finish_reason: FinishReason | None = cast(
             FinishReason | None, out.finish_reason
         )
@@ -797,7 +801,7 @@ def mlx_generate(
                     # Trim text to just before the stop sequence
                     stop_index = accumulated_text.find(stop_seq)
                     text_before_stop = accumulated_text[:stop_index]
-                    chunk_start = len(accumulated_text) - len(out.text)
+                    chunk_start = len(accumulated_text) - len(stripped_text)
                     text = text_before_stop[chunk_start:]
                     finish_reason = "stop"
                     stop_matched = True
