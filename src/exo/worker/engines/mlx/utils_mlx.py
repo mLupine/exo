@@ -827,46 +827,51 @@ def strip_gemma4_channel_tokens(text: str) -> str:
     if not text:
         return text
     
-    # Remove explicit channel tokens
-    text = text.replace(GEMMA4_SOC_TOKEN, "")
-    text = text.replace(GEMMA4_EOC_TOKEN, "")
-    text = text.replace(GEMMA4_TURN_START, "")
-    text = text.replace(GEMMA4_TURN_END, "")
-    
-    # Handle case where <|channel> is decoded as "thought\n"
-    # Pattern: "thought\n" followed by reasoning content
-    # We need to find where actual response starts (after reasoning)
-    # Gemma 4 format: "thought\n<reasoning>\n<actual_response>"
     import re
     
-    # Remove "thought" keyword at start if present
-    text = re.sub(r'^thought\s*\n?', '', text, flags=re.IGNORECASE)
+    # Remove explicit channel tokens (with surrounding whitespace/newlines)
+    text = re.sub(r'\s*' + re.escape(GEMMA4_SOC_TOKEN) + r'\s*', ' ', text)
+    text = re.escape(GEMMA4_EOC_TOKEN) + r'\s*', ' ', text)
+    text = re.sub(r'\s*' + re.escape(GEMMA4_TURN_START) + r'\s*', ' ', text)
+    text = re.sub(r'\s*' + re.escape(GEMMA4_TURN_END) + r'\s*', ' ', text)
     
-    # If there's still reasoning content before actual response,
-    # try to find boundary - usually there's a blank line or specific pattern
-    # Pattern: look for common response starters after reasoning
+    # Handle case where <|channel> is decoded as "thought\n"
+    # Remove "thought" section completely - it's reasoning content
+    # Pattern: "thought" followed by analysis lines until actual response
     lines = text.split('\n')
     result_lines = []
-    in_reasoning = True
+    in_thinking_section = False
+    found_thinking_keyword = False
     
-    for line in lines:
-        stripped = line.strip()
-        # Skip empty lines at start
-        if in_reasoning and not stripped:
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        
+        # Detect start of thinking section
+        if not found_thinking_keyword and stripped == 'thought':
+            found_thinking_keyword = True
+            in_thinking_section = True
             continue
-        # Check if this looks like start of actual response
-        # (shorter lines, no analysis keywords)
-        if in_reasoning and len(stripped) < 100 and not any(
-            kw in stripped.lower() for kw in ['input:', 'language:', 'tone:', 'the user', 'respond', 'option']
-        ):
-            in_reasoning = False
-        if not in_reasoning:
+        
+        if in_thinking_section:
+            # Check if this is the start of actual response
+            # Heuristic: short line without analysis keywords
+            if stripped and len(stripped) < 80 and not any(
+                kw in stripped for kw in ['input:', 'language:', 'tone:', 'the user', 
+                                          'respond', 'option', 'should', 'best', 'since']
+            ):
+                in_thinking_section = False
+                result_lines.append(line)
+        else:
             result_lines.append(line)
     
     result = '\n'.join(result_lines)
     
-    # Clean up any remaining artifacts
-    result = re.sub(r'Response:\s*["\']?([^"\']+)["\']?', r'\1', result)
+    # Clean up "Response:" artifact and quotes
+    result = re.sub(r'Response:\s*["\']?([^"\']+)["\']?', r'\1', result, flags=re.IGNORECASE)
+    
+    # Normalize multiple spaces/newlines
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    result = re.sub(r' {2,}', ' ', result)
     
     return result.strip()
 
