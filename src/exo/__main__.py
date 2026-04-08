@@ -5,6 +5,9 @@ from collections.abc import Sequence
 from multiprocessing import freeze_support
 from typing import Final
 
+# Explicit import to ensure PyInstaller includes this module in the bundle
+from exo.worker.engines.mlx import utils_mlx
+
 from exo.main import main
 
 INLINE_CODE_FLAG: Final[str] = "-c"
