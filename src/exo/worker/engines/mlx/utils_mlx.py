@@ -4,6 +4,7 @@ import re
 import sys
 import tempfile
 import time
+from numbers import Integral
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -37,6 +38,7 @@ import contextlib
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.utils
 from mlx_lm.utils import load_model
 from pydantic import RootModel
 
@@ -92,6 +94,37 @@ class HostList(RootModel[list[str]]):
     @classmethod
     def from_hosts(cls, hosts: list[Host]) -> "HostList":
         return cls(root=[str(host) for host in hosts])
+
+
+def should_demote_bfloat16(model_id: ModelId) -> bool:
+    model_id_lower = str(model_id).lower()
+    return "gemma-4" in model_id_lower or "gemma4" in model_id_lower
+
+
+def demote_bfloat16_tree(
+    tree: Any,
+    *,
+    model_id: ModelId,
+    label: str,
+) -> tuple[Any, int]:
+    if not should_demote_bfloat16(model_id):
+        return tree, 0
+
+    converted = 0
+
+    def _convert(value: Any) -> Any:
+        nonlocal converted
+        if isinstance(value, mx.array) and value.dtype == mx.bfloat16:
+            converted += 1
+            return value.astype(mx.float16)
+        return value
+
+    new_tree = mlx.utils.tree_map(_convert, tree)
+    if converted:
+        logger.warning(
+            f"Demoted {converted} BF16 tensor(s) to FP16 for {model_id} in {label}"
+        )
+    return new_tree, converted
 
 
 def mlx_distributed_init(
@@ -175,8 +208,30 @@ def load_mlx_items(
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
+        model_id = bound_instance.bound_shard.model_card.model_id
         start_time = time.perf_counter()
+
+        if should_demote_bfloat16(model_id):
+            try:
+                from exo.worker.engines.mlx.patches.gemma4_fp16 import patch_gemma4_fp16
+
+                patch_gemma4_fp16()
+                logger.warning(f"Enabled Gemma 4 FP16 patch for {model_id} before single-device load")
+            except Exception:
+                logger.exception(f"Failed to enable Gemma 4 FP16 patch for {model_id} before single-device load")
+                raise
+
         model, _ = load_model(model_path, lazy=True, strict=False)
+
+        demoted_params, demoted_count = demote_bfloat16_tree(
+            model.parameters(),
+            model_id=model_id,
+            label="single-device text model parameters",
+        )
+        if demoted_count:
+            model.update(demoted_params)
+            logger.warning(f"Demoted {demoted_count} BF16 tensors for {model_id} before single-device eval")
+
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -235,6 +290,20 @@ def shard_and_load(
 ) -> tuple[nn.Module, TokenizerWrapper]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
+    if should_demote_bfloat16(shard_metadata.model_card.model_id):
+        try:
+            from exo.worker.engines.mlx.patches.gemma4_fp16 import patch_gemma4_fp16
+
+            patch_gemma4_fp16()
+            logger.warning(
+                f"Enabled Gemma 4 FP16 patch for {shard_metadata.model_card.model_id} before shard load"
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to enable Gemma 4 FP16 patch for {shard_metadata.model_card.model_id} before shard load"
+            )
+            raise
+
     model, _ = load_model(model_path, lazy=True, strict=False)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
@@ -286,6 +355,14 @@ def shard_and_load(
                 "CfgShardMetadata is not supported for text model loading - "
                 "this metadata type is only for image generation models"
             )
+
+    demoted_params, demoted_count = demote_bfloat16_tree(
+        model.parameters(),
+        model_id=shard_metadata.model_card.model_id,
+        label="text model parameters",
+    )
+    if demoted_count:
+        model.update(demoted_params)
 
     # TODO: Do we need this?
     mx.eval(model)
@@ -633,6 +710,43 @@ def apply_chat_template(
     return prompt
 
 
+def normalize_encoded_tokens(encoded: Any) -> list[int]:
+    """Normalize tokenizer outputs to a plain ``list[int]``.
+
+    Some tokenizers, notably newer multimodal/chat variants, may return tuples
+    alongside token ids. MLX expects raw integer token ids when building
+    ``mx.array(...)`` inputs, so flatten tuple/list items to their first element.
+    """
+    if isinstance(encoded, mx.array):
+        return cast(list[int], encoded.tolist())
+
+    normalized: list[int] = []
+    flattened_tuple_tokens = 0
+
+    for item in encoded:
+        if isinstance(item, Integral):
+            normalized.append(int(item))
+            continue
+
+        if isinstance(item, (tuple, list)) and item:
+            first = item[0]
+            if isinstance(first, Integral):
+                normalized.append(int(first))
+                flattened_tuple_tokens += 1
+                continue
+
+        raise TypeError(
+            f"Unsupported tokenizer token item {item!r} of type {type(item).__name__}"
+        )
+
+    if flattened_tuple_tokens:
+        logger.warning(
+            f"Flattened {flattened_tuple_tokens} tuple token(s) from tokenizer.encode() output"
+        )
+
+    return normalized
+
+
 def system_prompt_token_count(
     task_params: TextGenerationTaskParams,
     tokenizer: TokenizerWrapper,
@@ -653,7 +767,11 @@ def system_prompt_token_count(
                 parts.append(msg.content)
     if len(parts) == 0:
         return 0
-    return len(tokenizer.encode(" ".join(parts), add_special_tokens=False))
+    return len(
+        normalize_encoded_tokens(
+            tokenizer.encode(" ".join(parts), add_special_tokens=False)
+        )
+    )
 
 
 def detect_thinking_prompt_suffix(prompt: str, tokenizer: TokenizerWrapper) -> bool:
@@ -768,10 +886,12 @@ def mx_any(bool_: bool, group: Group | None) -> bool:
     if group is None:
         return bool_
     num_true = mx.distributed.all_sum(
-        mx.array(bool_), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+        mx.array(1 if bool_ else 0, dtype=mx.int32),
+        group=group,
+        stream=mx.default_stream(mx.Device(mx.cpu)),
     )
     mx.eval(num_true)
-    return num_true.item() > 0
+    return int(num_true.item()) > 0
 
 
 def mx_barrier(group: Group | None):

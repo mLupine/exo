@@ -1,10 +1,45 @@
 import math
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.models import rope_utils
 
 _original_YarnRoPE_init = rope_utils.YarnRoPE.__init__  # noqa: N816
 _original_initialize_rope = rope_utils.initialize_rope
+
+
+class ProportionalRoPE(nn.Module):
+    def __init__(
+        self,
+        dims: int,
+        rotated_dims: int,
+        traditional: bool = False,
+        base: float = 10000.0,
+        factor: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.dims = dims
+        self.traditional = traditional
+        if rotated_dims > dims:
+            raise ValueError("rotated_dims should be smaller than dims")
+        exponents = mx.arange(0, rotated_dims, 2, dtype=mx.float32) / dims
+        self._freqs = mx.concatenate(
+            [
+                factor * (base**exponents),
+                mx.full(((dims - rotated_dims) // 2,), mx.inf),
+            ]
+        )
+
+    def __call__(self, x: mx.array, offset: int | mx.array = 0) -> mx.array:
+        return mx.fast.rope(
+            x,
+            self.dims,
+            traditional=self.traditional,
+            base=None,
+            scale=1.0,
+            offset=offset,
+            freqs=self._freqs,
+        )
 
 
 def _patched_yarn_init(
@@ -80,9 +115,7 @@ def _patched_initialize_rope(
             scaling_config.get("type") or scaling_config.get("rope_type", "default")
         )
 
-    # All the yarn rope types supported in mlx lm
-    if rope_type in ("yarn", "deepseek_yarn"):
-        assert scaling_config is not None
+    if scaling_config is not None:
         cfg = scaling_config
 
         def _float(key: str, default: float) -> float:
@@ -93,20 +126,31 @@ def _patched_initialize_rope(
             v = cfg.get(key)
             return int(v) if v is not None else default
 
-        return rope_utils.YarnRoPE(
-            dims=dims,
-            max_position_embeddings=max_position_embeddings or 2048,
-            traditional=traditional,
-            scaling_factor=_float("factor", 1.0),
-            base=base,
-            original_max_position_embeddings=_int(
-                "original_max_position_embeddings", 4096
-            ),
-            beta_fast=_float("beta_fast", 32),
-            beta_slow=_float("beta_slow", 1),
-            mscale=_float("mscale", 1),
-            mscale_all_dim=_float("mscale_all_dim", 0),
-        )
+        # All the yarn rope types supported in mlx lm
+        if rope_type in ("yarn", "deepseek_yarn"):
+            return rope_utils.YarnRoPE(
+                dims=dims,
+                max_position_embeddings=max_position_embeddings or 2048,
+                traditional=traditional,
+                scaling_factor=_float("factor", 1.0),
+                base=base,
+                original_max_position_embeddings=_int(
+                    "original_max_position_embeddings", 4096
+                ),
+                beta_fast=_float("beta_fast", 32),
+                beta_slow=_float("beta_slow", 1),
+                mscale=_float("mscale", 1),
+                mscale_all_dim=_float("mscale_all_dim", 0),
+            )
+
+        if rope_type == "proportional":
+            return ProportionalRoPE(
+                dims=dims,
+                rotated_dims=int(dims * _float("partial_rotary_factor", 1.0)),
+                traditional=traditional,
+                base=base,
+                factor=_float("factor", 1.0),
+            )
 
     return _original_initialize_rope(
         dims, base, traditional, scaling_config, max_position_embeddings

@@ -185,14 +185,33 @@ class PipelineLastLayer(CustomMlxLayer):
         self.is_prefill: bool = False
         self.queue_sends: bool = False
 
+    @staticmethod
+    def _split_output(output: Any) -> tuple[mx.array, tuple[Any, ...] | None]:
+        if isinstance(output, tuple):
+            if not output or not isinstance(output[0], mx.array):
+                raise TypeError(
+                    "PipelineLastLayer expected tuple output starting with mx.array"
+                )
+            return output[0], output[1:]
+        return cast(mx.array, output), None
+
+    @staticmethod
+    def _merge_output(
+        primary: mx.array, trailing: tuple[Any, ...] | None
+    ) -> mx.array | tuple[Any, ...]:
+        if trailing is None:
+            return primary
+        return (primary, *trailing)
+
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
         cache = self.original_layer_signature.bind_partial(
             x, *args, **kwargs
         ).arguments.get("cache", None)
 
-        output: mx.array = self.original_layer(x, *args, **kwargs)
+        raw_output = self.original_layer(x, *args, **kwargs)
+        output, trailing = self._split_output(raw_output)
 
-        # Eval layer output to materialize it before send — this splits the graph
+        # Eval layer output to materialize it before send, this splits the graph
         # so the send is isolated and the receiving rank's recv can complete.
         mx.eval(output)
 
@@ -221,7 +240,7 @@ class PipelineLastLayer(CustomMlxLayer):
             ]
             mx.eval(output)
 
-        return output
+        return cast(mx.array, self._merge_output(output, trailing))
 
 
 def set_pipeline_prefill(model: nn.Module, is_prefill: bool) -> None:

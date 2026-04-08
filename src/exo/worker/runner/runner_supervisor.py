@@ -125,6 +125,9 @@ class RunnerSupervisor:
             with contextlib.suppress(ClosedResourceError):
                 self._event_sender.close()
             with contextlib.suppress(ClosedResourceError):
+                logger.warning(
+                    f"RunnerSupervisor sending {CANCEL_ALL_TASKS} during shutdown for {self.bound_instance.bound_runner_id}"
+                )
                 self._cancel_sender.send(CANCEL_ALL_TASKS)
             with contextlib.suppress(ClosedResourceError):
                 self._cancel_sender.close()

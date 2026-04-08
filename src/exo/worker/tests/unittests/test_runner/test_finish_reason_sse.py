@@ -13,6 +13,10 @@ from exo.worker.engines.mlx.dsml_encoding import (
     TOOL_CALLS_END,
     TOOL_CALLS_START,
 )
+from exo.shared.types.common import ModelId
+from exo.shared.types.tasks import CANCEL_ALL_TASKS, TextGeneration
+from exo.shared.types.text_generation import InputMessage, TextGenerationTaskParams
+from exo.shared.types.worker.instances import InstanceId
 from exo.worker.runner.llm_inference.model_output_parsers import (
     parse_deepseek_v32,
     parse_thinking_models,
@@ -330,3 +334,133 @@ class TestBatchGeneratorSingleNext:
         assert _got_finish(collected), (
             f"No finish_reason in collected: {[(type(r).__name__, getattr(r, 'finish_reason', None) if isinstance(r, GenerationResponse) else 'tool') for r in collected]}"
         )
+
+
+class _DummyCancelReceiver:
+    def collect(self):
+        return []
+
+
+class _OneShotCancelReceiver:
+    def __init__(self, items: list[Any]):
+        self.items = items
+        self.calls = 0
+
+    def collect(self):
+        self.calls += 1
+        if self.calls == 1:
+            return list(self.items)
+        return []
+
+
+class _DummyEventSender:
+    def send(self, _event):
+        return None
+
+
+class TestSequentialGeneratorTerminalFallback:
+    def test_emits_empty_stop_when_mlx_generator_yields_nothing(self):
+        from exo.worker.runner.llm_inference.batch_generator import (
+            GeneratorQueue,
+            SequentialGenerator,
+        )
+
+        def _empty_gen():
+            if False:
+                yield None
+
+        def _idle_parser():
+            while True:
+                yield None
+
+        task = TextGeneration(
+            instance_id=InstanceId("instance-test"),
+            command_id="command-test",
+            task_params=TextGenerationTaskParams(
+                model=ModelId("mlx-community/gemma-4-31b-it-mxfp8"),
+                input=[InputMessage(role="user", content="Reply with exactly OKPATCHED")],
+            ),
+        )
+
+        generator = SequentialGenerator(
+            model=object(),
+            tokenizer=object(),
+            group=None,
+            kv_prefix_cache=None,
+            tool_parser=None,
+            model_id=ModelId("mlx-community/gemma-4-31b-it-mxfp8"),
+            device_rank=0,
+            cancel_receiver=_DummyCancelReceiver(),
+            event_sender=_DummyEventSender(),
+        )
+        generator._active = (  # pyright: ignore[reportPrivateUsage]
+            task,
+            _empty_gen(),
+            GeneratorQueue(),
+            _idle_parser(),
+        )
+
+        results = list(generator.step())
+        generation_results = [
+            result
+            for _, result in results
+            if isinstance(result, GenerationResponse)
+        ]
+
+        assert len(generation_results) == 1
+        assert generation_results[0].text == ""
+        assert generation_results[0].finish_reason == "stop"
+
+    def test_clears_stale_cancel_all_after_emitting_it(self):
+        from exo.worker.runner.llm_inference.batch_generator import SequentialGenerator
+
+        generator = SequentialGenerator(
+            model=object(),
+            tokenizer=object(),
+            group=None,
+            kv_prefix_cache=None,
+            tool_parser=None,
+            model_id=ModelId("mlx-community/gemma-4-31b-it-mxfp8"),
+            device_rank=0,
+            cancel_receiver=_DummyCancelReceiver(),
+            event_sender=_DummyEventSender(),
+        )
+        generator._cancelled_tasks.add(CANCEL_ALL_TASKS)  # pyright: ignore[reportPrivateUsage]
+
+        results = list(generator.step())
+
+        assert len(results) == 1
+        assert results[0][0] == CANCEL_ALL_TASKS
+        assert type(results[0][1]).__name__ == "Cancelled"
+        assert generator._cancelled_tasks == set()  # pyright: ignore[reportPrivateUsage]
+
+    def test_submit_drops_stale_startup_cancel_all_from_receiver(self):
+        from exo.worker.runner.llm_inference.batch_generator import SequentialGenerator
+
+        cancel_receiver = _OneShotCancelReceiver([CANCEL_ALL_TASKS])
+        task = TextGeneration(
+            instance_id=InstanceId("instance-test"),
+            command_id="command-test",
+            task_params=TextGenerationTaskParams(
+                model=ModelId("mlx-community/gemma-4-31b-it-mxfp8"),
+                input=[InputMessage(role="user", content="Reply with exactly OKPATCHED")],
+            ),
+        )
+
+        generator = SequentialGenerator(
+            model=object(),
+            tokenizer=object(),
+            group=None,
+            kv_prefix_cache=None,
+            tool_parser=None,
+            model_id=ModelId("mlx-community/gemma-4-31b-it-mxfp8"),
+            device_rank=0,
+            cancel_receiver=cancel_receiver,
+            event_sender=_DummyEventSender(),
+        )
+
+        generator.submit(task)
+
+        assert cancel_receiver.calls == 1
+        assert generator._cancelled_tasks == set()  # pyright: ignore[reportPrivateUsage]
+        assert generator.should_cancel(task.task_id) is False

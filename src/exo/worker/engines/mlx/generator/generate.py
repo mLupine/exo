@@ -1,8 +1,11 @@
 import contextlib
 import functools
 import math
+import os
+import socket
 import time
 from copy import deepcopy
+from pathlib import Path
 from typing import Callable, Generator, cast, get_args
 
 import mlx.core as mx
@@ -56,6 +59,7 @@ from exo.worker.engines.mlx.utils_mlx import (
     detect_thinking_prompt_suffix,
     fix_unmatched_think_end_tokens,
     mx_barrier,
+    normalize_encoded_tokens,
     system_prompt_token_count,
 )
 from exo.worker.engines.mlx.vision import (
@@ -70,6 +74,27 @@ from exo.worker.runner.bootstrap import logger
 generation_stream = mx.new_stream(mx.default_device())
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
+_GEMMA4_DEBUG_PATH = Path(
+    os.environ.get("EXO_GEMMA4_DEBUG_LOG", "/tmp/exo-gemma4-debug.log")
+)
+
+
+def _is_gemma4_model(model_id: ModelId | str) -> bool:
+    model_id_str = str(model_id).lower()
+    return "gemma-4" in model_id_str or "gemma4" in model_id_str
+
+
+def _gemma4_debug(model_id: ModelId | str, message: str) -> None:
+    if not _is_gemma4_model(model_id):
+        return
+    try:
+        _GEMMA4_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _GEMMA4_DEBUG_PATH.open("a", encoding="utf-8") as f:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            host = socket.gethostname()
+            f.write(f"{ts} host={host} pid={os.getpid()} {message}\n")
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
@@ -125,6 +150,7 @@ def pipeline_parallel_prefill(
     prompt_progress_callback: Callable[[int, int], None],
     distributed_prompt_progress_callback: Callable[[], None] | None,
     group: mx.distributed.Group,
+    debug_model_id: ModelId | None = None,
 ) -> None:
     """Prefill the KV cache for pipeline parallel with overlapping stages.
 
@@ -179,6 +205,11 @@ def pipeline_parallel_prefill(
     logger.info(
         f"[R{rank}] Pipeline prefill: {n_real} real + {n_leading} leading + {n_trailing} trailing = {n_total} iterations"
     )
+    if debug_model_id is not None:
+        _gemma4_debug(
+            debug_model_id,
+            f"pipeline_prefill_start rank={rank} world={world_size} total_tokens={total} real_chunks={n_real} leading={n_leading} trailing={n_trailing}",
+        )
     clear_prefill_sends()
 
     # Initial callback matching generate_step
@@ -227,10 +258,66 @@ def pipeline_parallel_prefill(
     # Final callback matching generate_step
     prompt_progress_callback(total, total)
 
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
     logger.info(
         f"[R{rank}] Prefill: {n_real} real + {n_leading}+{n_trailing} dummy iterations, "
-        f"Processed {processed} tokens in {(time.perf_counter() - t_start) * 1000:.1f}ms"
+        f"Processed {processed} tokens in {elapsed_ms:.1f}ms"
     )
+    if debug_model_id is not None:
+        _gemma4_debug(
+            debug_model_id,
+            f"pipeline_prefill_done rank={rank} processed={processed} elapsed_ms={elapsed_ms:.1f}",
+        )
+
+
+def sequential_prefill(
+    model: Model,
+    prompt: mx.array,
+    prompt_cache: KVCacheType,
+    prefill_step_size: int,
+    progress_callback: Callable[[int, int], None],
+    debug_model_id: ModelId | None = None,
+) -> None:
+    total = len(prompt)
+    processed = 0
+    quantize_cache_fn: Callable[..., None] = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=0,
+        kv_group_size=KV_GROUP_SIZE,
+        kv_bits=KV_BITS,
+    )
+
+    if debug_model_id is not None:
+        _gemma4_debug(
+            debug_model_id,
+            f"sequential_prefill_start total_tokens={total} step={prefill_step_size}",
+        )
+
+    progress_callback(0, total)
+
+    while processed < total - 1:
+        chunk_size = min(prefill_step_size, (total - 1) - processed)
+        with mx.stream(generation_stream):
+            model(prompt[processed : processed + chunk_size][None], cache=prompt_cache)
+            quantize_cache_fn(prompt_cache)
+        processed += chunk_size
+        progress_callback(processed, total)
+
+    for _ in range(2):
+        with mx.stream(generation_stream):
+            model(prompt[-1:][None], cache=prompt_cache)
+            quantize_cache_fn(prompt_cache)
+
+    with mx.stream(generation_stream):
+        mx.eval([c.state for c in prompt_cache])  # type: ignore
+
+    progress_callback(total, total)
+
+    if debug_model_id is not None:
+        _gemma4_debug(
+            debug_model_id,
+            f"sequential_prefill_done processed={processed} total_tokens={total}",
+        )
 
 
 def prefill(
@@ -242,6 +329,7 @@ def prefill(
     group: mx.distributed.Group | None,
     on_prefill_progress: Callable[[int, int], None] | None,
     distributed_prompt_progress_callback: Callable[[], None] | None,
+    debug_model_id: ModelId | None = None,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
@@ -256,6 +344,11 @@ def prefill(
         return 0.0, 0, []
 
     logger.debug(f"Prefilling {num_tokens} tokens...")
+    if debug_model_id is not None:
+        _gemma4_debug(
+            debug_model_id,
+            f"prefill_enter num_tokens={num_tokens} group={'none' if group is None else group.size()}",
+        )
     start_time = time.perf_counter()
     has_ssm = has_non_kv_caches(cache)
     snapshots: list[CacheSnapshot] = []
@@ -282,6 +375,8 @@ def prefill(
 
     mx_barrier(group)
     logger.info("Starting prefill")
+    if debug_model_id is not None:
+        _gemma4_debug(debug_model_id, "prefill_after_barrier")
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
@@ -301,6 +396,19 @@ def prefill(
                 prompt_progress_callback=progress_callback,
                 distributed_prompt_progress_callback=distributed_prompt_progress_callback,
                 group=group,
+                debug_model_id=debug_model_id,
+            )
+        elif debug_model_id is not None and (
+            "gemma-4" in str(debug_model_id).lower()
+            or "gemma4" in str(debug_model_id).lower()
+        ):
+            sequential_prefill(
+                model=model,
+                prompt=prompt_tokens,
+                prompt_cache=cache,
+                prefill_step_size=prefill_step_size,
+                progress_callback=combined_progress_callback,
+                debug_model_id=debug_model_id,
             )
         else:
             # Use max_tokens=1 because max_tokens=0 does not work.
@@ -344,6 +452,11 @@ def prefill(
         f"Prefill complete: {num_tokens} tokens in {elapsed:.2f}s "
         f"({tokens_per_sec:.1f} tok/s)"
     )
+    if debug_model_id is not None:
+        _gemma4_debug(
+            debug_model_id,
+            f"prefill_done num_tokens={num_tokens} elapsed_s={elapsed:.2f} tps={tokens_per_sec:.1f}",
+        )
     # Exclude the last snapshot
     return tokens_per_sec, num_tokens, snapshots[:-1] if snapshots else []
 
@@ -510,8 +623,13 @@ def mlx_generate(
     min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
 
     vision: VisionResult | None = None
+    _gemma4_debug(
+        task.model,
+        f"generate_enter prompt_chars={len(prompt)} input_tokens={len(all_prompt_tokens)} has_images={bool(task.images)}",
+    )
     if vision_processor is not None:
         try:
+            _gemma4_debug(task.model, "vision_prepare_start")
             vision = prepare_vision(
                 images=task.images,
                 chat_template_messages=task.chat_template_messages,
@@ -520,6 +638,10 @@ def mlx_generate(
                 model=model,
                 model_id=task.model,
                 task_params=task,
+            )
+            _gemma4_debug(
+                task.model,
+                f"vision_prepare_done used={vision is not None}",
             )
         except Exception:
             logger.opt(exception=True).warning(
@@ -599,6 +721,7 @@ def mlx_generate(
             group,
             on_prefill_progress,
             distributed_prompt_progress_callback,
+            debug_model_id=task.model,
         )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 
@@ -616,7 +739,14 @@ def mlx_generate(
     think_end = tokenizer.think_end
 
     logger.info("Starting decode")
+    _gemma4_debug(
+        task.model,
+        f"decode_start last_token_len={len(last_token)} max_tokens={max_tokens}",
+    )
     mx_barrier(group)
+    _gemma4_debug(task.model, "decode_after_barrier")
+
+    first_yield_logged = False
 
     for completion_tokens, out in enumerate(
         stream_generate(
@@ -633,6 +763,12 @@ def mlx_generate(
         ),
         start=1,
     ):
+        if not first_yield_logged:
+            _gemma4_debug(
+                task.model,
+                f"decode_first_yield token={out.token} finish_reason={out.finish_reason} text={out.text!r}",
+            )
+            first_yield_logged = True
         generated_text_parts.append(out.text)
         accumulated_text += out.text
 
@@ -715,10 +851,16 @@ def mlx_generate(
                 f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
                 f"{generation_tps:.1f} tok/s"
             )
+            _gemma4_debug(
+                task.model,
+                f"decode_done finish_reason={finish_reason} completion_tokens={completion_tokens}",
+            )
             if kv_prefix_cache is not None:
                 generated_tokens_array = mx.array(
-                    tokenizer.encode(
-                        "".join(generated_text_parts), add_special_tokens=False
+                    normalize_encoded_tokens(
+                        tokenizer.encode(
+                            "".join(generated_text_parts), add_special_tokens=False
+                        )
                     )
                 )
                 full_prompt_tokens = mx.concatenate(

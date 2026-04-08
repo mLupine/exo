@@ -1,4 +1,6 @@
 import itertools
+import os
+import socket
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -36,6 +38,21 @@ from .model_output_parsers import apply_all_parsers
 from .tool_parsers import ToolParser
 
 
+def _gemma4_seq_debug(model_id: ModelId, message: str) -> None:
+    model_id_str = str(model_id).lower()
+    if "gemma-4" not in model_id_str and "gemma4" not in model_id_str:
+        return
+    path = os.environ.get("EXO_GEMMA4_DEBUG_LOG", "/tmp/exo-gemma4-debug.log")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(
+                f"{ts} host={socket.gethostname()} pid={os.getpid()} seq {message}\n"
+            )
+    except Exception:
+        pass
+
+
 class Cancelled:
     pass
 
@@ -67,6 +84,11 @@ class InferenceGenerator(ABC):
             task_id in self._cancelled_tasks
             or CANCEL_ALL_TASKS in self._cancelled_tasks
         )
+
+    def take_cancellations(self) -> list[tuple[TaskId, "Cancelled"]]:
+        cancellations = [(task_id, Cancelled()) for task_id in self._cancelled_tasks]
+        self._cancelled_tasks.clear()
+        return cancellations
 
     @abstractmethod
     def warmup(self) -> None: ...
@@ -150,10 +172,21 @@ class SequentialGenerator(InferenceGenerator):
             model_id=self.model_id,
         )
 
+    def _drain_stale_startup_cancellations(self) -> None:
+        if self._active is not None or self._all_tasks or self._queue or self._maybe_queue:
+            return
+
+        stale = self.cancel_receiver.collect()
+        if stale:
+            logger.warning(
+                f"Dropping stale startup cancellations before first task: {stale!r}"
+            )
+
     def submit(
         self,
         task: TextGeneration,
     ) -> None:
+        self._drain_stale_startup_cancellations()
         self._cancelled_tasks.discard(CANCEL_ALL_TASKS)
         self._all_tasks[task.task_id] = task
         self._maybe_queue.append(task)
@@ -174,7 +207,12 @@ class SequentialGenerator(InferenceGenerator):
             if task_id in self._all_tasks:
                 self._maybe_cancel.append(self._all_tasks[task_id])
 
-        if mx_any(has_cancel_all, self.group):
+        cancel_all_agreed = mx_any(has_cancel_all, self.group)
+        if cancel_all_agreed and not has_cancel_all:
+            logger.warning(
+                "CANCEL_ALL_TASKS observed from another rank during BatchGenerator.agree_on_cancellations"
+            )
+        if cancel_all_agreed:
             self._cancelled_tasks.add(CANCEL_ALL_TASKS)
 
         agreed, different = mx_all_gather_tasks(self._maybe_cancel, self.group)
@@ -192,22 +230,64 @@ class SequentialGenerator(InferenceGenerator):
             if self._queue:
                 self._start_next()
             else:
-                return map(lambda task: (task, Cancelled()), self._cancelled_tasks)
+                return self.take_cancellations()
 
         assert self._active is not None
 
         task, mlx_gen, queue, output_generator = self._active
+        _gemma4_seq_debug(
+            self.model_id,
+            f"step_enter task_id={task.task_id} command_id={task.command_id}",
+        )
         output: list[
             tuple[TaskId, GenerationResponse | ToolCallResponse | Cancelled | Finished]
         ] = []
         try:
+            _gemma4_seq_debug(
+                self.model_id,
+                f"next_start task_id={task.task_id} command_id={task.command_id}",
+            )
             response = next(mlx_gen)
+            _gemma4_seq_debug(
+                self.model_id,
+                f"next_return finish_reason={response.finish_reason!r} text_len={len(response.text)} task_id={task.task_id}",
+            )
             queue.push(response)
             # drain potentially many responses every time
             while (parsed := next(output_generator, None)) is not None:
                 output.append((task.task_id, parsed))
 
-        except (StopIteration, PrefillCancelled):
+        except PrefillCancelled:
+            _gemma4_seq_debug(
+                self.model_id,
+                f"prefill_cancelled task_id={task.task_id}",
+            )
+            output.append((task.task_id, Cancelled()))
+            self._active = None
+            if self._queue:
+                self._start_next()
+
+        except StopIteration:
+            _gemma4_seq_debug(
+                self.model_id,
+                f"terminal_without_response task_id={task.task_id}",
+            )
+            while (parsed := next(output_generator, None)) is not None:
+                output.append((task.task_id, parsed))
+
+            if not output:
+                output.append(
+                    (
+                        task.task_id,
+                        GenerationResponse(
+                            text="",
+                            token=0,
+                            finish_reason="stop",
+                            usage=None,
+                        ),
+                    )
+                )
+
             output.append((task.task_id, Finished()))
             self._active = None
             if self._queue:
@@ -218,10 +298,7 @@ class SequentialGenerator(InferenceGenerator):
             self._active = None
             raise
 
-        return itertools.chain(
-            output,
-            map(lambda task: (task, Cancelled()), self._cancelled_tasks),
-        )
+        return itertools.chain(output, self.take_cancellations())
 
     def _start_next(self) -> None:
         task = self._queue.popleft()
@@ -261,9 +338,18 @@ class SequentialGenerator(InferenceGenerator):
 
     def _build_generator(self, task: TextGeneration) -> Generator[GenerationResponse]:
         _check_for_debug_prompts(task.task_params)
+        _gemma4_seq_debug(
+            self.model_id,
+            f"build_generator task_id={task.task_id} command_id={task.command_id}",
+        )
         prompt = apply_chat_template(self.tokenizer, task.task_params)
 
+        model_id_str = str(self.model_id).lower()
+        disable_prefill_progress = "gemma-4" in model_id_str or "gemma4" in model_id_str
+
         def on_prefill_progress(processed: int, total: int) -> None:
+            if disable_prefill_progress:
+                return
             if self.device_rank == 0:
                 self.event_sender.send(
                     ChunkGenerated(
@@ -339,6 +425,7 @@ class BatchGenerator(InferenceGenerator):
             TextGeneration,
             GeneratorQueue[GenerationResponse],
             Generator[GenerationResponse | ToolCallResponse | None],
+            int,
         ],
     ] = field(default_factory=dict, init=False)
 
@@ -376,14 +463,24 @@ class BatchGenerator(InferenceGenerator):
     def agree_on_cancellations(self) -> None:
         """Agree between all ranks about which tasks to cancel."""
         has_cancel_all = False
-        for task_id in self.cancel_receiver.collect():
+        collected = self.cancel_receiver.collect()
+        if collected:
+            logger.warning(
+                f"SequentialGenerator collected cancellations active={self._active[0].task_id if self._active else None} known={list(self._all_tasks.keys())} ids={collected!r}"
+            )
+        for task_id in collected:
             if task_id == CANCEL_ALL_TASKS:
                 has_cancel_all = True
                 continue
             if task_id in self._all_tasks:
                 self._maybe_cancel.append(self._all_tasks[task_id])
 
-        if mx_any(has_cancel_all, self.group):
+        cancel_all_agreed = mx_any(has_cancel_all, self.group)
+        if cancel_all_agreed and not has_cancel_all:
+            logger.warning(
+                "CANCEL_ALL_TASKS observed from another rank during SequentialGenerator.agree_on_cancellations"
+            )
+        if cancel_all_agreed:
             self._cancelled_tasks.add(CANCEL_ALL_TASKS)
 
         agreed, different = mx_all_gather_tasks(self._maybe_cancel, self.group)
@@ -422,7 +519,7 @@ class BatchGenerator(InferenceGenerator):
                     self.model_id,
                     task.task_params.tools,
                 )
-            self._active_tasks[uid] = (task, queue, output_generator)
+            self._active_tasks[uid] = (task, queue, output_generator, 0)
 
         if not self._mlx_gen.has_work:
             return self._apply_cancellations()
@@ -438,11 +535,27 @@ class BatchGenerator(InferenceGenerator):
                 logger.warning(f"{uid=} not found in active tasks")
                 continue
 
-            task, queue, output_generator = self._active_tasks[uid]
+            task, queue, output_generator, emitted_count = self._active_tasks[uid]
             queue.push(response)
+            emitted_this_step = 0
             # If a generator fails to parse for some reason and returns early, we should not crash
             while (parsed := next(output_generator, None)) is not None:
                 output.append((task.task_id, parsed))
+                emitted_this_step += 1
+
+            total_emitted = emitted_count + emitted_this_step
+
+            # If parsers swallowed the whole stream, fall back to the raw terminal response
+            # so the API never completes with an empty 200/bodyless success.
+            if response.finish_reason is not None and total_emitted == 0:
+                logger.warning(
+                    f"No parsed chunks emitted for terminal response on {task.task_id=}; "
+                    "falling back to raw response"
+                )
+                output.append((task.task_id, response))
+                total_emitted += 1
+
+            self._active_tasks[uid] = (task, queue, output_generator, total_emitted)
 
             # check if original response was terminal and append a Finished()
             if response.finish_reason is not None:
@@ -462,7 +575,7 @@ class BatchGenerator(InferenceGenerator):
         uids_to_cancel: list[int] = []
         results: list[tuple[TaskId, Cancelled]] = []
 
-        for uid, (task, _, _) in list(self._active_tasks.items()):
+        for uid, (task, _, _, _) in list(self._active_tasks.items()):
             if task.task_id in self._cancelled_tasks or cancel_all:
                 uids_to_cancel.append(uid)
                 results.append((task.task_id, Cancelled()))

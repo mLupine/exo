@@ -16,6 +16,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 from exo.shared.types.memory import Memory
 from exo.shared.types.mlx import KVCacheType, Model
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
+from exo.worker.engines.mlx.utils_mlx import normalize_encoded_tokens
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -320,7 +321,9 @@ def encode_prompt(tokenizer: TokenizerWrapper, prompt: str) -> mx.array:
     that would corrupt the prompt structure.
     """
     # Chat templates define their own structure - don't add BOS/EOS
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    prompt_tokens = normalize_encoded_tokens(
+        tokenizer.encode(prompt, add_special_tokens=False)
+    )
     return mx.array(prompt_tokens)
 
 

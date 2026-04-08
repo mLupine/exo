@@ -1,4 +1,5 @@
 import os
+import socket
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -64,6 +65,21 @@ from exo.worker.runner.llm_inference.batch_generator import (
     InferenceGenerator,
     SequentialGenerator,
 )
+
+
+def _gemma4_runner_debug(model_id: str, message: str) -> None:
+    model_id_str = str(model_id).lower()
+    if "gemma-4" not in model_id_str and "gemma4" not in model_id_str:
+        return
+    path = os.environ.get("EXO_GEMMA4_DEBUG_LOG", "/tmp/exo-gemma4-debug.log")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(
+                f"{ts} host={socket.gethostname()} pid={os.getpid()} runner {message}\n"
+            )
+    except Exception:
+        pass
 
 from .batch_generator import Cancelled, Finished
 from .tool_parsers import make_mlx_parser
@@ -261,6 +277,10 @@ class Runner:
 
     def submit_text_generation(self, task: TextGeneration):
         assert isinstance(self.generator, InferenceGenerator)
+        _gemma4_runner_debug(
+            self.model_id,
+            f"submit_text_generation task_id={task.task_id} command_id={task.command_id}",
+        )
         self.active_tasks[task.task_id] = task
         self.generator.submit(task)
 
@@ -277,10 +297,18 @@ class Runner:
         self.submit_text_generation(starting_task)
 
         while self.active_tasks:
+            _gemma4_runner_debug(
+                self.model_id,
+                f"handle_generation_tasks loop active={len(self.active_tasks)}",
+            )
             results = self.generator.step()
 
             finished: list[TaskId] = []
             for task_id, result in results:
+                _gemma4_runner_debug(
+                    self.model_id,
+                    f"handle_generation_tasks result task_id={task_id} result={type(result).__name__}",
+                )
                 match result:
                     case Cancelled():
                         finished.append(task_id)
@@ -415,8 +443,20 @@ class Builder:
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH"):
-            logger.info("using SequentialGenerator (batching disabled)")
+        model_id_str = str(self.model_id).lower()
+        force_sequential = (
+            os.environ.get("EXO_NO_BATCH") is not None
+            or "gemma-4" in model_id_str
+            or "gemma4" in model_id_str
+        )
+        if force_sequential:
+            reason = (
+                "batching disabled"
+                if os.environ.get("EXO_NO_BATCH")
+                else "Gemma 4 batch path disabled"
+            )
+            logger.info(f"using SequentialGenerator ({reason})")
+            _gemma4_runner_debug(self.model_id, f"generator=Sequential reason={reason}")
             return SequentialGenerator(
                 model=self.inference_model,
                 tokenizer=self.tokenizer,
@@ -430,6 +470,7 @@ class Builder:
                 vision_processor=vision_processor,
             )
         logger.info("using BatchGenerator")
+        _gemma4_runner_debug(self.model_id, "generator=Batch")
         return BatchGenerator(
             model=self.inference_model,
             tokenizer=self.tokenizer,

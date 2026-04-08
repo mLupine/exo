@@ -28,6 +28,7 @@ from exo.shared.types.mlx import Model
 from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.worker.engines.mlx.cache import encode_prompt
 from exo.worker.engines.mlx.utils_mlx import (
+    demote_bfloat16_tree,
     fix_unmatched_think_end_tokens,
     render_chat_template,
 )
@@ -133,6 +134,7 @@ class VisionResult:
 class VisionEncoder:
     def __init__(self, config: VisionCardConfig, model_id: ModelId):
         self._config = config
+        self._model_id = model_id
         self._main_model_path = build_model_path(model_id)
         self._model_path = build_model_path(ModelId(config.weights_repo))
         self._vision_tower: nn.Module | None = None
@@ -249,6 +251,12 @@ class VisionEncoder:
                     np_tensor = tensor.float().numpy()  # type: ignore
                     weights[key] = mx.array(np_tensor, dtype=mx.bfloat16)  # type: ignore
 
+        weights, _ = demote_bfloat16_tree(
+            weights,
+            model_id=self._model_id,
+            label="vision source weights",
+        )
+
         vision_weights: dict[str, mx.array] = {}
         projector_weights: dict[str, mx.array] = {}
         for key, val in weights.items():
@@ -273,6 +281,17 @@ class VisionEncoder:
                     "proj.2.", "linear_2."
                 )
                 projector_weights[short_key] = val
+
+        vision_weights, _ = demote_bfloat16_tree(
+            vision_weights,
+            model_id=self._model_id,
+            label="vision tower weights",
+        )
+        projector_weights, _ = demote_bfloat16_tree(
+            projector_weights,
+            model_id=self._model_id,
+            label="vision projector weights",
+        )
 
         assert self._vision_tower is not None
         self._vision_tower.load_weights(list(vision_weights.items()))
@@ -317,6 +336,12 @@ class VisionEncoder:
         assert self._vision_tower is not None
         if found_raw_prefix and hasattr(self._vision_tower, "sanitize"):
             vision_weights = self._vision_tower.sanitize(vision_weights)  # type: ignore
+
+        vision_weights, _ = demote_bfloat16_tree(
+            vision_weights,
+            model_id=self._model_id,
+            label="bundled vision weights",
+        )
 
         self._vision_tower.load_weights(list(vision_weights.items()))  # type: ignore
         mx.eval(self._vision_tower.parameters())

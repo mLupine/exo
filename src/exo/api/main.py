@@ -24,7 +24,7 @@ from loguru import logger
 
 from exo.api.adapters.chat_completions import (
     chat_request_to_text_generation,
-    collect_chat_response,
+    collect_chat_response_object,
     fetch_image_url,
     generate_chat_stream,
 )
@@ -256,6 +256,10 @@ class API:
             CommandId,
             Sender[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk],
         ] = {}
+        self._text_generation_receivers: dict[
+            CommandId,
+            Receiver[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk],
+        ] = {}
         self._image_generation_queues: dict[
             CommandId, Sender[ImageChunk | ErrorChunk]
         ] = {}
@@ -269,6 +273,7 @@ class API:
         self.state = State()
         self._system_id = SystemId()
         self._text_generation_queues = {}
+        self._text_generation_receivers = {}
         self._image_generation_queues = {}
         self.unpause(result_clock)
         self.event_receiver.close()
@@ -620,6 +625,19 @@ class API:
             command_id=command_id,
         )
 
+    def _ensure_text_generation_queue(
+        self, command_id: CommandId
+    ) -> Receiver[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk]:
+        recv = self._text_generation_receivers.get(command_id)
+        if recv is not None:
+            return recv
+        sender, recv = channel[
+            TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+        ]()
+        self._text_generation_queues[command_id] = sender
+        self._text_generation_receivers[command_id] = recv
+        return recv
+
     async def _token_chunk_stream(
         self, command_id: CommandId
     ) -> AsyncGenerator[
@@ -630,9 +648,7 @@ class API:
         This is the internal low-level stream used by all API adapters.
         """
         try:
-            self._text_generation_queues[command_id], recv = channel[
-                TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
-            ]()
+            recv = self._ensure_text_generation_queue(command_id)
 
             with recv as token_chunks:
                 async for chunk in token_chunks:
@@ -653,6 +669,8 @@ class API:
             await self._send(TaskFinished(finished_command_id=command_id))
             if command_id in self._text_generation_queues:
                 del self._text_generation_queues[command_id]
+            if command_id in self._text_generation_receivers:
+                del self._text_generation_receivers[command_id]
 
     async def _collect_text_generation_with_stats(
         self, command_id: CommandId
@@ -736,6 +754,7 @@ class API:
         images = task_params.images
         if not images:
             command = TextGeneration(task_params=task_params)
+            self._ensure_text_generation_queue(command.command_id)
             await self._send(command)
             return command
 
@@ -755,6 +774,7 @@ class API:
                 update={"images": [], "image_hashes": cached_hashes}
             )
             command = TextGeneration(task_params=task_params)
+            self._ensure_text_generation_queue(command.command_id)
             await self._send(command)
             return command
 
@@ -772,6 +792,7 @@ class API:
             }
         )
         command = TextGeneration(task_params=task_params)
+        self._ensure_text_generation_queue(command.command_id)
 
         for global_idx, (img_idx, chunk_data) in enumerate(all_chunks):
             await self._send(
@@ -818,12 +839,9 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
-                collect_chat_response(
-                    command.command_id,
-                    self._token_chunk_stream(command.command_id),
-                ),
-                media_type="application/json",
+            return await collect_chat_response_object(
+                command.command_id,
+                self._token_chunk_stream(command.command_id),
             )
 
     async def bench_chat_completions(

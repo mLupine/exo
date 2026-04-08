@@ -85,6 +85,28 @@ def test_composed_wrappers_delegate_attributes() -> None:
     assert composed.use_sliding is True  # type: ignore[attr-defined]
 
 
+class TupleLayer(mlx_nn.Module):
+    def __call__(
+        self, x: mx.array, *args: object, **kwargs: object
+    ) -> tuple[mx.array, str, int]:
+        return x * 2, "kvs", 7
+
+
+def test_pipeline_last_layer_handles_tuple_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    group = mx.distributed.init()
+
+    monkeypatch.setattr(
+        mx.distributed, "all_gather", lambda x, group=None: x  # type: ignore[arg-type]
+    )
+
+    layer = PipelineLastLayer(TupleLayer(), r=0, s=1, group=group)
+    output = layer(mx.ones((1, 4)))
+
+    assert isinstance(output, tuple)
+    assert output[1:] == ("kvs", 7)
+    assert (output[0] == 2.0).all()
+
+
 def test_missing_attribute_raises() -> None:
     mock = MockLayer()
     wrapped = CustomMlxLayer(mock)
