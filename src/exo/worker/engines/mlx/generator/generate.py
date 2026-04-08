@@ -114,16 +114,16 @@ def strip_gemma4_channel_tokens(text: str) -> str:
         else:
             result_lines.append(line)
     
-    result = '\n'.join(result_lines)
-    
+    result = ' '.join(result_lines)  # Join with spaces instead of newlines
+
     # Clean up "Response:" artifact and quotes
     result = re.sub(r'Response:\s*["\']?([^"\']+)["\']?', r'\1', result, flags=re.IGNORECASE)
-    
+
     # Normalize multiple spaces/newlines
-    result = re.sub(r'\n{3,}', '\n\n', result)
-    result = re.sub(r' {2,}', ' ', result)
-    
-    return result.strip()
+    result = re.sub(r'\s+', ' ', result)  # Normalize all whitespace to single space
+    result = result.strip()
+
+    return result
 from exo.worker.engines.mlx.vision import (
     MediaRegion,
     VisionProcessor,
