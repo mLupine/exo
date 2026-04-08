@@ -61,9 +61,65 @@ from exo.worker.engines.mlx.utils_mlx import (
     fix_unmatched_think_end_tokens,
     mx_barrier,
     normalize_encoded_tokens,
-    strip_gemma4_channel_tokens,
     system_prompt_token_count,
 )
+
+# Gemma 4 channel tokens for reasoning (copied here to avoid PyInstaller import issues)
+GEMMA4_SOC_TOKEN = "<|channel>"
+GEMMA4_EOC_TOKEN = "<channel|>"
+GEMMA4_TURN_START = "<|turn>"
+GEMMA4_TURN_END = "<turn|>"
+
+
+def strip_gemma4_channel_tokens(text: str) -> str:
+    """Strip Gemma 4 reasoning channel tokens from generated text."""
+    if not text:
+        return text
+    
+    import re
+    
+    # Remove explicit channel tokens (with surrounding whitespace/newlines)
+    text = re.sub(r'\s*' + re.escape(GEMMA4_SOC_TOKEN) + r'\s*', ' ', text)
+    text = re.sub(r'\s*' + re.escape(GEMMA4_EOC_TOKEN) + r'\s*', ' ', text)
+    text = re.sub(r'\s*' + re.escape(GEMMA4_TURN_START) + r'\s*', ' ', text)
+    text = re.sub(r'\s*' + re.escape(GEMMA4_TURN_END) + r'\s*', ' ', text)
+    
+    # Handle case where <|channel> is decoded as "thought\n"
+    lines = text.split('\n')
+    result_lines = []
+    in_thinking_section = False
+    found_thinking_keyword = False
+    
+    for line in lines:
+        stripped = line.strip().lower()
+        
+        # Detect start of thinking section
+        if not found_thinking_keyword and stripped == 'thought':
+            found_thinking_keyword = True
+            in_thinking_section = True
+            continue
+        
+        if in_thinking_section:
+            # Check if this is the start of actual response
+            if stripped and len(stripped) < 80 and not any(
+                kw in stripped for kw in ['input:', 'language:', 'tone:', 'the user', 
+                                          'respond', 'option', 'should', 'best', 'since', 'analysis']
+            ):
+                in_thinking_section = False
+                result_lines.append(line)
+        else:
+            result_lines.append(line)
+    
+    result = '\n'.join(result_lines)
+    
+    # Clean up "Response:" artifact and quotes
+    result = re.sub(r'Response:\s*["\']?([^"\']+)["\']?', r'\1', result, flags=re.IGNORECASE)
+    
+    # Normalize multiple spaces/newlines
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    result = re.sub(r' {2,}', ' ', result)
+    
+    return result.strip()
 from exo.worker.engines.mlx.vision import (
     MediaRegion,
     VisionProcessor,
