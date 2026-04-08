@@ -66,6 +66,7 @@ DATAS: list[tuple[str, str]] = [
     (str(RESOURCES_DIR), "resources"),
     (str(MLX_LIB_DIR), "mlx/lib"),
     (str(EXO_SHARED_MODELS_DIR), "exo/shared/models"),
+    (str(SOURCE_ROOT / "exo"), "exo"),
 ]
 
 MACMON_PATH = shutil.which("macmon")
