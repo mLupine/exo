@@ -57,6 +57,7 @@ HIDDEN_IMPORTS = sorted(
         collect_submodules("mlx")
         + _safe_collect("mlx_lm")
         + _safe_collect("transformers")
+        + ["exo.worker.engines.mlx.utils_mlx"]
     )
 )
 
