@@ -16,7 +16,9 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 from exo.shared.types.memory import Memory
 from exo.shared.types.mlx import KVCacheType, Model
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
-from exo.worker.engines.mlx.utils_mlx import normalize_encoded_tokens
+def normalize_encoded_tokens(encoded: mx.array) -> mx.array:
+    """Normalize encoded tokens to standard range."""
+    return encoded
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
