@@ -811,6 +811,8 @@ def fix_unmatched_think_end_tokens(
 # Gemma 4 channel tokens for reasoning
 GEMMA4_SOC_TOKEN = "<|channel>"
 GEMMA4_EOC_TOKEN = "<channel|>"
+GEMMA4_TURN_START = "<|turn>"
+GEMMA4_TURN_END = "<turn|>"
 
 
 def strip_gemma4_channel_tokens(text: str) -> str:
@@ -818,13 +820,55 @@ def strip_gemma4_channel_tokens(text: str) -> str:
 
     Gemma 4 uses <|channel> and <|channel|> tokens to wrap reasoning/thinking
     content. These should be stripped from the output visible to users.
+    
+    Also handles cases where tokenizer decodes tokens to plain text like
+    'thought' instead of '<|channel>'.
     """
     if not text:
         return text
-    # Remove both start and end channel tokens
+    
+    # Remove explicit channel tokens
     text = text.replace(GEMMA4_SOC_TOKEN, "")
     text = text.replace(GEMMA4_EOC_TOKEN, "")
-    return text
+    text = text.replace(GEMMA4_TURN_START, "")
+    text = text.replace(GEMMA4_TURN_END, "")
+    
+    # Handle case where <|channel> is decoded as "thought\n"
+    # Pattern: "thought\n" followed by reasoning content
+    # We need to find where actual response starts (after reasoning)
+    # Gemma 4 format: "thought\n<reasoning>\n<actual_response>"
+    import re
+    
+    # Remove "thought" keyword at start if present
+    text = re.sub(r'^thought\s*\n?', '', text, flags=re.IGNORECASE)
+    
+    # If there's still reasoning content before actual response,
+    # try to find boundary - usually there's a blank line or specific pattern
+    # Pattern: look for common response starters after reasoning
+    lines = text.split('\n')
+    result_lines = []
+    in_reasoning = True
+    
+    for line in lines:
+        stripped = line.strip()
+        # Skip empty lines at start
+        if in_reasoning and not stripped:
+            continue
+        # Check if this looks like start of actual response
+        # (shorter lines, no analysis keywords)
+        if in_reasoning and len(stripped) < 100 and not any(
+            kw in stripped.lower() for kw in ['input:', 'language:', 'tone:', 'the user', 'respond', 'option']
+        ):
+            in_reasoning = False
+        if not in_reasoning:
+            result_lines.append(line)
+    
+    result = '\n'.join(result_lines)
+    
+    # Clean up any remaining artifacts
+    result = re.sub(r'Response:\s*["\']?([^"\']+)["\']?', r'\1', result)
+    
+    return result.strip()
 
 
 class NullKVCache(KVCache):
