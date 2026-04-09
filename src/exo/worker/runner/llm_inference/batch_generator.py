@@ -28,8 +28,10 @@ from exo.worker.engines.mlx.generator.generate import (
 )
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
+    mx_all_gather_ints,
     mx_all_gather_tasks,
     mx_any,
+    mx_count_true,
 )
 from exo.worker.engines.mlx.vision import VisionProcessor
 from exo.worker.runner.bootstrap import logger
@@ -201,6 +203,10 @@ class SequentialGenerator(InferenceGenerator):
         """Agree between all ranks about which tasks to cancel."""
         has_cancel_all = False
         collected = self.cancel_receiver.collect()
+        _gemma4_seq_debug(
+            self.model_id,
+            f"agree_cancel_enter task_id={self._active[0].task_id if self._active else None} collected={collected!r} maybe_cancel={[task.task_id for task in self._maybe_cancel]!r} cancelled={list(self._cancelled_tasks)!r}",
+        )
         if collected:
             logger.warning(
                 f"SequentialGenerator collected cancellations active={self._active[0].task_id if self._active else None} known={list(self._all_tasks.keys())} ids={collected!r}"
@@ -212,7 +218,13 @@ class SequentialGenerator(InferenceGenerator):
             if task_id in self._all_tasks:
                 self._maybe_cancel.append(self._all_tasks[task_id])
 
-        cancel_all_agreed = mx_any(has_cancel_all, self.group)
+        gathered_cancel_flags = mx_all_gather_ints(1 if has_cancel_all else 0, self.group)
+        cancel_all_count = mx_count_true(has_cancel_all, self.group)
+        cancel_all_agreed = cancel_all_count > 0
+        _gemma4_seq_debug(
+            self.model_id,
+            f"agree_cancel_after_all_sum task_id={self._active[0].task_id if self._active else None} local_has_cancel_all={has_cancel_all} gathered_cancel_flags={gathered_cancel_flags!r} cancel_all_count={cancel_all_count} group_size={self.group.size() if self.group is not None else 1}",
+        )
         if cancel_all_agreed and not has_cancel_all:
             logger.warning(
                 "CANCEL_ALL_TASKS observed from another rank during SequentialGenerator.agree_on_cancellations"
@@ -223,6 +235,10 @@ class SequentialGenerator(InferenceGenerator):
         agreed, different = mx_all_gather_tasks(self._maybe_cancel, self.group)
         self._cancelled_tasks.update(task.task_id for task in agreed)
         self._maybe_cancel = list(different)
+        _gemma4_seq_debug(
+            self.model_id,
+            f"agree_cancel_exit task_id={self._active[0].task_id if self._active else None} agreed_cancel={[task.task_id for task in agreed]!r} remaining_maybe_cancel={[task.task_id for task in self._maybe_cancel]!r} cancelled={list(self._cancelled_tasks)!r}",
+        )
 
     def step(
         self,

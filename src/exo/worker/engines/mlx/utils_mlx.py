@@ -951,15 +951,25 @@ def mlx_cleanup(
 
 
 def mx_any(bool_: bool, group: Group | None) -> bool:
+    return mx_count_true(bool_, group) > 0
+
+
+def mx_count_true(bool_: bool, group: Group | None) -> int:
     if group is None:
-        return bool_
-    num_true = mx.distributed.all_sum(
-        mx.array(1 if bool_ else 0, dtype=mx.int32),
+        return 1 if bool_ else 0
+    return sum(mx_all_gather_ints(1 if bool_ else 0, group))
+
+
+def mx_all_gather_ints(value: int, group: Group | None) -> list[int]:
+    if group is None:
+        return [value]
+    gathered = mx.distributed.all_gather(
+        mx.array([value], dtype=mx.int32),
         group=group,
         stream=mx.default_stream(mx.Device(mx.cpu)),
     )
-    mx.eval(num_true)
-    return int(num_true.item()) > 0
+    mx.eval(gathered)
+    return [int(x) for x in gathered.tolist()]
 
 
 def mx_barrier(group: Group | None):
