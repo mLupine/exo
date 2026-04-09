@@ -64,70 +64,6 @@ from exo.worker.engines.mlx.utils_mlx import (
     system_prompt_token_count,
 )
 
-# Gemma 4 channel tokens for reasoning (copied here to avoid PyInstaller import issues)
-GEMMA4_SOC_TOKEN = "<|channel>"
-GEMMA4_EOC_TOKEN = "<channel|>"
-GEMMA4_TURN_START = "<|turn>"
-GEMMA4_TURN_END = "<turn|>"
-
-
-def strip_gemma4_channel_tokens(text: str) -> str:
-    """Strip Gemma 4 reasoning channel tokens from generated text."""
-    if not text:
-        return text
-    
-    import re
-    
-    # Remove explicit channel tokens (with surrounding whitespace/newlines)
-    text = re.sub(r'\s*' + re.escape(GEMMA4_SOC_TOKEN) + r'\s*', ' ', text)
-    text = re.sub(r'\s*' + re.escape(GEMMA4_EOC_TOKEN) + r'\s*', ' ', text)
-    text = re.sub(r'\s*' + re.escape(GEMMA4_TURN_START) + r'\s*', ' ', text)
-    text = re.sub(r'\s*' + re.escape(GEMMA4_TURN_END) + r'\s*', ' ', text)
-    
-    # Handle case where <|channel> is decoded as "thought\n"
-    lines = text.split('\n')
-    result_lines = []
-    in_thinking_section = False
-    found_thinking_keyword = False
-    
-    for line in lines:
-        stripped = line.strip().lower()
-        
-        # Detect start of thinking section
-        if not found_thinking_keyword and stripped == 'thought':
-            found_thinking_keyword = True
-            in_thinking_section = True
-            continue
-        
-        if in_thinking_section:
-            # Check if this is the start of actual response
-            if stripped and len(stripped) < 80 and not any(
-                kw in stripped for kw in ['input:', 'language:', 'tone:', 'the user',
-                                          'respond', 'option', 'should', 'best', 'since', 'analysis']
-            ):
-                in_thinking_section = False
-                # Add space before first word after thinking section
-                if result_lines and not result_lines[-1].endswith(' '):
-                    result_lines.append(' ' + line)
-                else:
-                    result_lines.append(line)
-        else:
-            result_lines.append(line)
-    
-    result = ' '.join(result_lines)  # Join with spaces instead of newlines
-
-    # Clean up "Response:" artifact and quotes
-    result = re.sub(r'Response:\s*["\']?([^"\']+)["\']?', r'\1', result, flags=re.IGNORECASE)
-
-    # Normalize multiple spaces/newlines
-    result = re.sub(r'\s+', ' ', result)  # Normalize all whitespace to single space
-    result = result.strip()
-
-    # Add trailing space for proper concatenation with next chunk
-    if result and not result.endswith(' '):
-        result += ' '
-
-    return result
 from exo.worker.engines.mlx.vision import (
     MediaRegion,
     VisionProcessor,
@@ -833,27 +769,26 @@ def mlx_generate(
         ),
         start=1,
     ):
-        # Strip Gemma 4 channel tokens from output
-        stripped_text = strip_gemma4_channel_tokens(out.text)
+        text_segment = out.text
 
         if not first_yield_logged:
             _gemma4_debug(
                 task.model,
-                f"decode_first_yield token={out.token} finish_reason={out.finish_reason} text={stripped_text!r}",
+                f"decode_first_yield token={out.token} finish_reason={out.finish_reason} text={text_segment!r}",
             )
             first_yield_logged = True
-        generated_text_parts.append(stripped_text)
-        accumulated_text += stripped_text
+        generated_text_parts.append(text_segment)
+        accumulated_text += text_segment
 
-        if think_start is not None and stripped_text == think_start:
+        if think_start is not None and text_segment == think_start:
             in_thinking = True
-        elif think_end is not None and stripped_text == think_end:
+        elif think_end is not None and text_segment == think_end:
             in_thinking = False
         if in_thinking:
             reasoning_tokens += 1
 
         # Check for stop sequences
-        text = stripped_text
+        text = text_segment
         finish_reason: FinishReason | None = cast(
             FinishReason | None, out.finish_reason
         )
@@ -865,7 +800,7 @@ def mlx_generate(
                     # Trim text to just before the stop sequence
                     stop_index = accumulated_text.find(stop_seq)
                     text_before_stop = accumulated_text[:stop_index]
-                    chunk_start = len(accumulated_text) - len(stripped_text)
+                    chunk_start = len(accumulated_text) - len(text_segment)
                     text = text_before_stop[chunk_start:]
                     finish_reason = "stop"
                     stop_matched = True
